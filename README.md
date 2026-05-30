@@ -1,4 +1,4 @@
-# startrek
+# Star Trek release date tool
 
 Offline CLI for Star Trek episode, Short Treks, and movie **original US air/release dates**.
 
