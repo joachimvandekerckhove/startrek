@@ -4,7 +4,7 @@ Offline CLI for Star Trek episode, Short Treks, and movie **original US air/rele
 
 Every query is a **calendar date range** (matching month/day, ignoring year). Results are always shown as a table.
 
-## Install (friends)
+## Install
 
 Requires [Docker](https://docs.docker.com/get-docker/) and `git`.
 
@@ -74,7 +74,7 @@ git add -A && git commit -m "Release 1.2.0"
 git tag v1.2.0 && git push origin main --tags
 ```
 
-Tell friends to re-run the install one-liner (or set `STARTREK_VERSION=v1.2.0`).
+Users then re-run the install one-liner (or set `STARTREK_VERSION=v1.2.0`).
 
 ## Data sources
 
