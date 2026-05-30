@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="${STARTREK_IMAGE:-startrek:1.1.0}"
+
+TZ_VALUE="${TZ:-}"
+if [[ -z "${TZ_VALUE}" && -f /etc/timezone ]]; then
+  TZ_VALUE="$(cat /etc/timezone)"
+fi
+TZ_VALUE="${TZ_VALUE:-UTC}"
+
+exec docker run --rm -i \
+  -e "TZ=${TZ_VALUE}" \
+  "${IMAGE}" \
+  "$@"

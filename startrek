@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Star Trek air-date CLI — offline lookup of original US air/release dates."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import textwrap
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+VERSION = "1.1.0"
+ATTRIBUTION = (
+    "Data: STAPI (stapi.co, Memory Alpha-derived) and Memory Alpha (CC BY-NC 3.0)"
+)
+
+SERIES_ALIASES: dict[str, str] = {
+    "TOS": "TOS",
+    "TAS": "TAS",
+    "TNG": "TNG",
+    "DS9": "DS9",
+    "VOY": "VOY",
+    "ENT": "ENT",
+    "DIS": "DIS",
+    "PIC": "PIC",
+    "LD": "LD",
+    "SNW": "SNW",
+    "PRO": "PRO",
+    "SA": "SA",
+    "ST": "ST",
+    "SHORTTREKS": "ST",
+    "SHORT": "ST",
+    "FILM": "FILM",
+    "MOVIE": "FILM",
+    "MOVIES": "FILM",
+}
+
+DATE_FMT = "%a %b %d, %Y"
+_OFFSET_ARG = re.compile(r"^[+-]\d+(?:days?|weeks?)$", re.I)
+_DAY_OFFSET = re.compile(r"^([+-])(\d+)\s*days?$", re.I)
+_WEEK_OFFSET = re.compile(r"^([+-])(\d+)\s*weeks?$", re.I)
+
+
+@dataclass
+class Row:
+    kind: str
+    series_key: str | None
+    series_title: str
+    season_number: int | None
+    episode_number: int | None
+    title: str
+    air_date: str
+    summary: str | None
+
+
+@dataclass(frozen=True)
+class DateRange:
+    start: date
+    end: date
+
+    @property
+    def single_day(self) -> bool:
+        return self.start == self.end
+
+    def label(self) -> str:
+        if self.single_day:
+            return f"on {self.start.strftime(DATE_FMT)}"
+        return (
+            f"from {self.start.strftime(DATE_FMT)} "
+            f"to {self.end.strftime(DATE_FMT)}"
+        )
+
+
+def resolve_db_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("STARTREK_DB")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parent / "startrek.db"
+
+
+def terminal_width(default: int = 100) -> int:
+    try:
+        return shutil.get_terminal_size(fallback=(default, 24)).columns
+    except OSError:
+        return default
+
+
+def parse_absolute_date(expr: str) -> date | None:
+    expr = expr.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(expr, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_date_expr(expr: str, base: date | None = None) -> date:
+    base = base or date.today()
+    expr = expr.strip()
+    lower = expr.lower()
+    if lower in ("today", "now"):
+        return base
+    if lower == "yesterday":
+        return base - timedelta(days=1)
+    if lower == "tomorrow":
+        return base + timedelta(days=1)
+    absolute = parse_absolute_date(expr)
+    if absolute is not None:
+        return absolute
+    raise ValueError(f"cannot parse date: {expr!r}")
+
+
+def offset_amount(expr: str) -> tuple[str, int] | None:
+    """Return ('day'|'week', signed amount) or None."""
+    compact = expr.strip().lower().replace(" ", "")
+    m = _DAY_OFFSET.match(compact)
+    if m:
+        sign = 1 if m.group(1) == "+" else -1
+        return ("day", sign * int(m.group(2)))
+    m = _WEEK_OFFSET.match(compact)
+    if m:
+        sign = 1 if m.group(1) == "+" else -1
+        return ("week", sign * int(m.group(2)))
+    return None
+
+
+def endpoint_from_arg(expr: str, base: date) -> date:
+    """Map an offset or date expression to a calendar endpoint."""
+    parsed = offset_amount(expr)
+    if parsed is not None:
+        unit, n = parsed
+        delta = timedelta(weeks=n) if unit == "week" else timedelta(days=n)
+        return base + delta
+    return parse_date_expr(expr, base)
+
+
+def range_from_offset(expr: str, base: date) -> DateRange | None:
+    """+N: [today, today+N]; -N: [today-N, today]. +0week/+0days -> None (no output)."""
+    parsed = offset_amount(expr)
+    if parsed is None:
+        raise ValueError(f"cannot parse offset: {expr!r}")
+    unit, n = parsed
+    if n == 0:
+        return None
+    delta = timedelta(weeks=n) if unit == "week" else timedelta(days=n)
+    if n > 0:
+        return DateRange(base, base + delta)
+    return DateRange(base + delta, base)
+
+
+def resolve_range(args: list[str], base: date) -> DateRange | None:
+    if not args:
+        return DateRange(base, base)
+    if len(args) == 1:
+        arg = args[0]
+        if offset_amount(arg) is not None:
+            return range_from_offset(arg, base)
+        d = parse_date_expr(arg, base)
+        return DateRange(d, d)
+    if len(args) == 2:
+        d0 = endpoint_from_arg(args[0], base)
+        d1 = endpoint_from_arg(args[1], base)
+        start, end = (d0, d1) if d0 <= d1 else (d1, d0)
+        return DateRange(start, end)
+    raise ValueError(
+        "too many arguments; use one date/offset, or two dates/offsets as range endpoints"
+    )
+
+
+def normalize_argv(argv: list[str] | None) -> list[str]:
+    if argv is None:
+        argv = sys.argv
+    if len(argv) <= 1:
+        return argv
+    prog, *rest = argv
+    prefix: list[str] = []
+    tail: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if _OFFSET_ARG.match(tok):
+            tail.append(tok)
+            i += 1
+            continue
+        if tok == "--db" and i + 1 < len(rest):
+            prefix.extend([tok, rest[i + 1]])
+            i += 2
+            continue
+        prefix.append(tok)
+        i += 1
+    if tail:
+        return [prog, *prefix, "--", *tail]
+    return argv
+
+
+def month_day(d: date) -> str:
+    return d.strftime("%m-%d")
+
+
+def format_air_date(iso: str) -> str:
+    return datetime.strptime(iso, "%Y-%m-%d").strftime(DATE_FMT)
+
+
+def format_se(season: int | None, episode: int | None, kind: str) -> str:
+    if kind == "movie":
+        return "Film"
+    if season is None or episode is None:
+        return "?"
+    return f"S{season:02d}E{episode:02d}"
+
+
+def truncate(text: str, width: int) -> str:
+    if width <= 1 or len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 1] + "\u2026"
+
+
+def format_table(
+    columns: list[str],
+    rows: list[list[str]],
+    max_width: int | None = None,
+) -> str:
+    if not rows:
+        return ""
+    max_width = max_width or terminal_width()
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    total = sum(widths) + 3 * (len(columns) - 1) + 4
+    if total > max_width and len(columns) >= 3:
+        overflow = total - max_width
+        for idx in (1, len(columns) - 1):
+            if overflow <= 0:
+                break
+            shrink = min(overflow, max(0, widths[idx] - 12))
+            widths[idx] -= shrink
+            overflow -= shrink
+        for i, row in enumerate(rows):
+            for idx in (1, len(columns) - 1):
+                rows[i][idx] = truncate(row[idx], widths[idx])
+
+    def hline(left: str, mid: str, right: str, fill: str) -> str:
+        parts = [fill * (w + 2) for w in widths]
+        return left + mid.join(parts) + right
+
+    def fmt_row(cells: list[str]) -> str:
+        padded = [f" {cells[i]:<{widths[i]}} " for i in range(len(columns))]
+        return "\u2502" + "\u2502".join(padded) + "\u2502"
+
+    lines = [
+        hline("\u250c", "\u252c", "\u2510", "\u2500"),
+        fmt_row(columns),
+        hline("\u251c", "\u253c", "\u2524", "\u2500"),
+    ]
+    for row in rows:
+        lines.append(fmt_row(row))
+    lines.append(hline("\u2514", "\u2534", "\u2518", "\u2500"))
+    return "\n".join(lines)
+
+
+def row_month_day(row: Row) -> str:
+    return row.air_date[5:10]
+
+
+def sort_rows(rows: list[Row], *, range_day_order: list[str] | None = None) -> list[Row]:
+    def tiebreak(row: Row) -> tuple:
+        return (
+            row.series_title,
+            row.season_number if row.season_number is not None else -1,
+            row.episode_number if row.episode_number is not None else -1,
+            row.title,
+        )
+
+    if range_day_order:
+        order = {md: i for i, md in enumerate(range_day_order)}
+
+        def key(row: Row) -> tuple:
+            return (order.get(row_month_day(row), 9999), *tiebreak(row))
+
+        return sorted(rows, key=key)
+
+    def key(row: Row) -> tuple:
+        return (row_month_day(row), *tiebreak(row))
+
+    return sorted(rows, key=key)
+
+
+def iter_range_month_days(start: date, end: date) -> list[str]:
+    if end < start:
+        start, end = end, start
+    days: list[str] = []
+    cur = start
+    while cur <= end:
+        md = month_day(cur)
+        if md not in days:
+            days.append(md)
+        cur += timedelta(days=1)
+    return days
+
+
+def rows_for_range(conn: sqlite3.Connection, dr: DateRange) -> list[Row]:
+    day_order = iter_range_month_days(dr.start, dr.end)
+    if not day_order:
+        return []
+    placeholders = ",".join("?" * len(day_order))
+    cur = conn.execute(
+        f"""
+        SELECT kind, series_key, series_title, season_number, episode_number,
+               title, air_date, summary
+        FROM entries
+        WHERE month_day IN ({placeholders})
+        """,
+        tuple(day_order),
+    )
+    rows = [
+        Row(
+            kind=r[0],
+            series_key=r[1],
+            series_title=r[2],
+            season_number=r[3],
+            episode_number=r[4],
+            title=r[5],
+            air_date=r[6],
+            summary=r[7],
+        )
+        for r in cur.fetchall()
+    ]
+    return sort_rows(rows, range_day_order=day_order)
+
+
+def row_to_table_cells(row: Row) -> list[str]:
+    return [
+        format_air_date(row.air_date),
+        row.series_title,
+        format_se(row.season_number, row.episode_number, row.kind),
+        row.title,
+    ]
+
+
+def print_summaries(rows: list[Row]) -> None:
+    with_summary = [r for r in rows if r.summary]
+    if not with_summary:
+        return
+    print("\nSummary")
+    print("\u2500" * 7)
+    for row in with_summary:
+        print(row.title)
+        print(
+            textwrap.fill(
+                row.summary or "",
+                width=max(40, terminal_width() - 2),
+                initial_indent="  ",
+                subsequent_indent="  ",
+            )
+        )
+        print()
+
+
+def print_range_results(
+    conn: sqlite3.Connection,
+    dr: DateRange,
+    *,
+    show_summary: bool = False,
+) -> None:
+    rows = rows_for_range(conn, dr)
+    print(f"Star Trek {dr.label()} (by original air/release date)")
+    if not rows:
+        print(f"No episodes {dr.label()}.")
+        return
+    table_rows = [row_to_table_cells(r) for r in rows]
+    print(format_table(["Original Date", "Series", "S/E", "Title"], table_rows))
+    if show_summary:
+        print_summaries(rows)
+
+
+def resolve_series_key(name: str) -> str | None:
+    key = name.strip().upper().replace(" ", "")
+    if key in SERIES_ALIASES:
+        return SERIES_ALIASES[key]
+    return key if len(key) <= 6 else None
+
+
+def lookup_episode(
+    conn: sqlite3.Connection,
+    series: str,
+    season: int,
+    episode: int,
+) -> Row | None:
+    key = resolve_series_key(series)
+    if not key:
+        return None
+    cur = conn.execute(
+        """
+        SELECT kind, series_key, series_title, season_number, episode_number,
+               title, air_date, summary
+        FROM entries
+        WHERE kind = 'episode' AND series_key = ? AND season_number = ?
+              AND episode_number = ?
+        LIMIT 1
+        """,
+        (key, season, episode),
+    )
+    r = cur.fetchone()
+    return Row(*r) if r else None
+
+
+def lookup_movie(conn: sqlite3.Connection, query: str) -> Row | None:
+    q = query.strip()
+    if q.isdigit():
+        cur = conn.execute(
+            """
+            SELECT kind, series_key, series_title, season_number, episode_number,
+                   title, air_date, summary
+            FROM entries
+            WHERE kind = 'movie'
+            ORDER BY air_date
+            LIMIT 1 OFFSET ?
+            """,
+            (int(q) - 1,),
+        )
+    else:
+        cur = conn.execute(
+            """
+            SELECT kind, series_key, series_title, season_number, episode_number,
+                   title, air_date, summary
+            FROM entries
+            WHERE kind = 'movie' AND title LIKE ?
+            ORDER BY air_date
+            LIMIT 1
+            """,
+            (f"%{q}%",),
+        )
+    r = cur.fetchone()
+    return Row(*r) if r else None
+
+
+def parse_lookup_args(rest: list[str]) -> tuple[str, int | None, int | None, str | None]:
+    if not rest:
+        raise SystemExit("lookup requires series and season/episode, e.g. lookup TNG 3 15")
+    series = rest[0]
+    if resolve_series_key(series) == "FILM":
+        if len(rest) < 2:
+            raise SystemExit("lookup film requires title or number, e.g. lookup film 3")
+        return series, None, None, " ".join(rest[1:])
+    if len(rest) >= 2:
+        m = re.match(r"^s?(\d+)[ex](\d+)$", rest[1], re.I)
+        if m:
+            return series, int(m.group(1)), int(m.group(2)), None
+    if len(rest) >= 3 and rest[1].isdigit() and rest[2].isdigit():
+        return series, int(rest[1]), int(rest[2]), None
+    raise SystemExit("usage: lookup SERIES SEASON EPISODE | lookup TNG S03E15 | lookup film 3")
+
+
+def cmd_lookup(conn: sqlite3.Connection, rest: list[str]) -> int:
+    series, season, episode, movie_q = parse_lookup_args(rest)
+    key = resolve_series_key(series)
+    if key == "FILM":
+        row = lookup_movie(conn, movie_q or "")
+    else:
+        if season is None or episode is None:
+            print("Invalid lookup.", file=sys.stderr)
+            return 1
+        row = lookup_episode(conn, series, season, episode)
+    if not row:
+        print("No matching entry found.", file=sys.stderr)
+        return 1
+    print("Lookup result")
+    print(format_table(["Original Date", "Series", "S/E", "Title"], [row_to_table_cells(row)]))
+    if row.summary:
+        print()
+        print(textwrap.fill(row.summary, width=max(40, terminal_width() - 2)))
+    else:
+        print("\n(No summary available.)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="startrek",
+        description=(
+            "Show Star Trek episodes, Short Treks, and movies whose original "
+            "US air/release date falls on the same calendar day(s) as a date range."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Every query is a calendar date range (month/day match, year ignored):\n"
+            "  startrek                    today\n"
+            "  startrek 2019-12-12         that day\n"
+            "  startrek 2026-06-01 2026-06-07   explicit range\n"
+            "  startrek +1week             today through one week from today\n"
+            "  startrek -1week             one week ago through today\n"
+            "  startrek +2days             today through two days from today\n"
+            "  startrek +10days -5days     five days ago through ten days ahead\n"
+            "  startrek lookup TNG 3 15    episode lookup with summary\n"
+        ),
+    )
+    p.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}\n{ATTRIBUTION}",
+    )
+    p.add_argument("-s", "--summary", action="store_true", help="Include plot summaries")
+    p.add_argument("--db", metavar="PATH", help="Path to startrek.db")
+    p.add_argument(
+        "args",
+        nargs="*",
+        help="[lookup ...] | [DATE] | [FROM TO] | [+/-OFFSET]",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = normalize_argv(argv)
+    parser = build_parser()
+    ns = parser.parse_args(argv[1:])
+    db_path = resolve_db_path(ns.db)
+    if not db_path.is_file():
+        print(f"Database not found: {db_path}", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    if ns.args and ns.args[0].lower() == "lookup":
+        return cmd_lookup(conn, ns.args[1:])
+
+    base = date.today()
+    try:
+        dr = resolve_range(ns.args, base)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if dr is None:
+        return 0
+
+    print_range_results(conn, dr, show_summary=ns.summary)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
